@@ -264,6 +264,13 @@ func (in *DruidNodeSpec) DeepCopyInto(out *DruidNodeSpec) {
 		*out = new(v1beta1.PodDisruptionBudgetSpec)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.NodeSelector != nil {
+		in, out := &in.NodeSelector, &out.NodeSelector
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.Services != nil {
 		in, out := &in.Services, &out.Services
 		*out = make([]v1.Service, len(*in))

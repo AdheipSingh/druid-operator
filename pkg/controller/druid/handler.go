@@ -624,7 +624,7 @@ func makeStatefulSet(nodeSpec *v1alpha1.DruidNodeSpec, sdk client.Client, m *v1a
 					Annotations: firstNonNilValue(nodeSpec.PodAnnotations, m.Spec.PodAnnotations).(map[string]string),
 				},
 				Spec: v1.PodSpec{
-					NodeSelector: m.Spec.NodeSelector,
+					NodeSelector: firstNonNilValue(nodeSpec.NodeSelector, m.Spec.NodeSelector).(map[string]string),
 					Tolerations:  tolerations,
 					Affinity:     affinity,
 					Containers: []v1.Container{

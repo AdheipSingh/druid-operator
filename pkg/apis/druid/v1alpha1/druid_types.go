@@ -133,6 +133,9 @@ type DruidNodeSpec struct {
 	// Optional
 	PodDisruptionBudgetSpec *v1beta1.PodDisruptionBudgetSpec `json:"podDisruptionBudgetSpec"`
 
+	// Optional: node selector to be used by Druid statefulsets
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
 	// Required
 	RuntimeProperties string `json:"runtime.properties"`
 
