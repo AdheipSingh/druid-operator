@@ -104,6 +104,14 @@ spec:
         limits:
           memory: "2G"
           cpu: "2"
+      ingress:    
+         rules:
+            - host: foo.bar.com
+              http:
+                paths:
+                 - backend:
+                    serviceName: service1
+                    servicePort: 80
 
     coordinators:
       nodeType: "coordinator"
