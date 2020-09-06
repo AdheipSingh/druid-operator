@@ -177,6 +177,13 @@ func deployDruidCluster(sdk client.Client, m *v1alpha1.Druid) error {
 			}
 		}
 
+		if nodeSpec.Kind != "Deployment" {
+			ok, err := stsDelete(sdk, &nodeSpec, nodeSpecUniqueStr, m)
+			if !ok {
+				return err
+			}
+		}
+
 		// Create Ingress Spec
 		if nodeSpec.Ingress != nil {
 			if _, err := sdkCreateOrUpdateAsNeeded(sdk,
@@ -630,6 +637,35 @@ func getPersistentVolumeClaim(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Drui
 
 	return pvc
 
+}
+
+func stsDelete(sdk client.Client, nodeSpec *v1alpha1.DruidNodeSpec, name string, drd *v1alpha1.Druid) (bool, error) {
+	sts := makeStatefulSetEmptyObj()
+	if err := sdk.Get(context.TODO(), *namespacedName(name, drd.Namespace), sts); err != nil {
+		e := fmt.Errorf("failed to get [StatefuleSet:%s] due to [%s]", name, err.Error())
+		logger.Error(e, e.Error(), "name", drd.Name, "namespace", drd.Namespace)
+		sendEvent(sdk, drd, v1.EventTypeWarning, "GET_FAIL", e.Error())
+		return false, e
+	}
+
+	var desPVCSize, currPVCSize int
+	for i := range nodeSpec.VolumeClaimTemplates {
+		desPVCSize = nodeSpec.VolumeClaimTemplates[i].Spec.Resources.Size()
+	}
+
+	for i := range sts.Spec.VolumeClaimTemplates {
+		currPVCSize = sts.Spec.VolumeClaimTemplates[i].Spec.Resources.Size()
+	}
+
+	if desPVCSize != currPVCSize {
+		if err := sdk.Delete(context.TODO(), sts, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
+			e := fmt.Errorf("failed to Delete [StatefuleSet:%s] due to [%s]", name, err.Error())
+			logger.Error(e, e.Error(), "name", drd.Name, "namespace", drd.Namespace)
+			sendEvent(sdk, drd, v1.EventTypeWarning, "DELETE_FAIL", e.Error())
+			return false, e
+		}
+	}
+	return true, nil
 }
 
 func getVolumeMounts(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid) []v1.VolumeMount {
