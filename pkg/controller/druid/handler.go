@@ -6,9 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 
 	autoscalev2beta1 "k8s.io/api/autoscaling/v2beta1"
 	extensions "k8s.io/api/extensions/v1beta1"
@@ -119,15 +122,38 @@ func deployDruidCluster(sdk client.Client, m *v1alpha1.Druid) error {
 		firstServiceName := ""
 		services := firstNonNilValue(nodeSpec.Services, m.Spec.Services).([]v1.Service)
 		for _, svc := range services {
-			if _, err := sdkCreateOrUpdateAsNeeded(sdk,
-				func() (object, error) { return makeService(&svc, &nodeSpec, m, lm, nodeSpecUniqueStr) },
-				func() object { return makeServiceEmptyObj() },
-				func(prev, curr object) { (curr.(*v1.Service)).Spec.ClusterIP = (prev.(*v1.Service)).Spec.ClusterIP },
-				m, serviceNames); err != nil {
-				return err
-			}
-			if firstServiceName == "" {
-				firstServiceName = svc.ObjectMeta.Name
+			//for i := 0; i < int(nodeSpec.Replicas); i++ {
+			if nodeSpec.NodeType != middleManager {
+				if _, err := sdkCreateOrUpdateAsNeeded(sdk,
+					func() (object, error) {
+						return makeService(&svc, &nodeSpec, m, lm, nodeSpecUniqueStr)
+					},
+					func() object { return makeServiceEmptyObj() },
+					func(prev, curr object) { (curr.(*v1.Service)).Spec.ClusterIP = (prev.(*v1.Service)).Spec.ClusterIP },
+					m, serviceNames); err != nil {
+					return err
+				}
+				if firstServiceName == "" {
+					firstServiceName = svc.ObjectMeta.Name
+				}
+			} else if nodeSpec.NodeType == middleManager {
+				for i := 0; i < int(nodeSpec.Replicas); i++ {
+
+					if _, err := sdkCreateOrUpdateAsNeeded(sdk,
+						func() (object, error) {
+							return makeServiceMM(&svc, &nodeSpec, m, lm, nodeSpecUniqueStr+strconv.Itoa(i)+"-"+strconv.Itoa(i), nodeSpecUniqueStr)
+						},
+						func() object { return makeServiceEmptyObj() },
+						func(prev, curr object) { (curr.(*v1.Service)).Spec.ClusterIP = (prev.(*v1.Service)).Spec.ClusterIP },
+						m, serviceNames); err != nil {
+						return err
+					}
+					if firstServiceName == "" {
+						firstServiceName = svc.ObjectMeta.Name
+					}
+					ScaleDown("http://" + nodeSpecUniqueStr + strconv.Itoa(i) + "-" + strconv.Itoa(i) + "." + m.Namespace + ".svc.cluster.local:8091/druid/worker/v1/tasks")
+					//HTTP("http://localhost:8091/druid/worker/v1/tasks")
+				}
 			}
 		}
 
@@ -155,24 +181,50 @@ func deployDruidCluster(sdk client.Client, m *v1alpha1.Druid) error {
 			}
 		} else {
 			// Create/Update StatefulSet
-			if stsCreateUpdateStatus, err := sdkCreateOrUpdateAsNeeded(sdk,
-				func() (object, error) {
-					return makeStatefulSet(&nodeSpec, m, lm, nodeSpecUniqueStr, fmt.Sprintf("%s-%s", commonConfigSHA, nodeConfigSHA), firstServiceName)
-				},
-				func() object { return makeStatefulSetEmptyObj() },
-				nil, m, statefulSetNames); err != nil {
-				return err
-			} else if m.Spec.RollingDeploy {
-
-				if stsCreateUpdateStatus == resourceUpdated {
-					// we just updated, give sts controller some time to update status of replicas after update
-					return nil
-				}
-
-				// Check StatefulSet rolling update status, if in-progress then stop here
-				done, err := isStsFullyDeployed(sdk, nodeSpecUniqueStr, m)
-				if !done {
+			if nodeSpec.NodeType != middleManager {
+				if stsCreateUpdateStatus, err := sdkCreateOrUpdateAsNeeded(sdk,
+					func() (object, error) {
+						return makeStatefulSet(&nodeSpec, m, lm, nodeSpecUniqueStr, fmt.Sprintf("%s-%s", commonConfigSHA, nodeConfigSHA), firstServiceName)
+					},
+					func() object { return makeStatefulSetEmptyObj() },
+					nil, m, statefulSetNames); err != nil {
 					return err
+				} else if m.Spec.RollingDeploy {
+
+					if stsCreateUpdateStatus == resourceUpdated {
+						// we just updated, give sts controller some time to update status of replicas after update
+						return nil
+					}
+
+					// Check StatefulSet rolling update status, if in-progress then stop here
+					done, err := isStsFullyDeployed(sdk, nodeSpecUniqueStr, m)
+					if !done {
+						return err
+					}
+				}
+			} else if nodeSpec.NodeType == middleManager {
+				for i := 0; i < int(nodeSpec.Replicas); i++ {
+
+					if stsCreateUpdateStatus, err := sdkCreateOrUpdateAsNeeded(sdk,
+						func() (object, error) {
+							return makeStatefulSetMM(&nodeSpec, m, lm, nodeSpecUniqueStr+strconv.Itoa(i), nodeSpecUniqueStr, fmt.Sprintf("%s-%s", commonConfigSHA, nodeConfigSHA), firstServiceName)
+						},
+						func() object { return makeStatefulSetEmptyObj() },
+						nil, m, statefulSetNames); err != nil {
+						return err
+					} else if m.Spec.RollingDeploy {
+
+						if stsCreateUpdateStatus == resourceUpdated {
+							// we just updated, give sts controller some time to update status of replicas after update
+							return nil
+						}
+
+						// Check StatefulSet rolling update status, if in-progress then stop here
+						done, err := isStsFullyDeployed(sdk, nodeSpecUniqueStr, m)
+						if !done {
+							return err
+						}
+					}
 				}
 			}
 		}
@@ -366,6 +418,63 @@ func deleteUnusedResources(sdk client.Client, drd *v1alpha1.Druid,
 type object interface {
 	metav1.Object
 	runtime.Object
+}
+
+func sdkCreateOrUpdateAsNeededR(sdk client.Client, objFn func() (object, error), emptyObjFn func() object, updaterFn func(prev, curr object), drd *v1alpha1.Druid, names map[string]bool) (string, error) {
+	if obj, err := objFn(); err != nil {
+		return "", err
+	} else {
+		names[obj.GetName()] = true
+
+		addOwnerRefToObject(obj, asOwnerR(drd))
+		addHashToObject(obj)
+
+		prevObj := emptyObjFn()
+		if err := sdk.Get(context.TODO(), *namespacedName(obj.GetName(), obj.GetNamespace()), prevObj); err != nil {
+			if apierrors.IsNotFound(err) {
+				// resource does not exist, create it.
+				if err := sdkCreate(context.TODO(), sdk, obj); err != nil {
+					e := fmt.Errorf("Failed to create [%s:%s] due to [%s].", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName(), err.Error())
+					logger.Error(e, e.Error(), "object", stringifyForLogging(obj, drd), "name", drd.Name, "namespace", drd.Namespace, "errorType", apierrors.ReasonForError(err))
+					sendEvent(sdk, drd, v1.EventTypeWarning, "CREATE_FAIL", e.Error())
+					return "", e
+				} else {
+					msg := fmt.Sprintf("Created [%s:%s].", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName())
+					logger.Info(msg, "Object", stringifyForLogging(obj, drd), "name", drd.Name, "namespace", drd.Namespace)
+					sendEvent(sdk, drd, v1.EventTypeNormal, "CREATE_SUCCESS", msg)
+					return resourceCreated, nil
+				}
+			} else {
+				e := fmt.Errorf("Failed to get [%s:%s] due to [%s].", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName(), err.Error())
+				logger.Error(e, e.Error(), "Prev object", stringifyForLogging(prevObj, drd), "name", drd.Name, "namespace", drd.Namespace)
+				sendEvent(sdk, drd, v1.EventTypeWarning, "GET_FAIL", e.Error())
+				return "", e
+			}
+		} else {
+			// resource already exists, updated it if needed
+			if obj.GetAnnotations()[druidOpResourceHash] != prevObj.GetAnnotations()[druidOpResourceHash] {
+
+				obj.SetResourceVersion(prevObj.GetResourceVersion())
+				if updaterFn != nil {
+					updaterFn(prevObj, obj)
+				}
+
+				if err := sdk.Update(context.TODO(), obj); err != nil {
+					e := fmt.Errorf("Failed to update [%s:%s] due to [%s].", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName(), err.Error())
+					logger.Error(e, e.Error(), "Current Object", stringifyForLogging(prevObj, drd), "Updated Object", stringifyForLogging(obj, drd), "name", drd.Name, "namespace", drd.Namespace)
+					sendEvent(sdk, drd, v1.EventTypeWarning, "UPDATE_FAIL", e.Error())
+					return "", e
+				} else {
+					msg := fmt.Sprintf("Updated [%s:%s].", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName())
+					logger.Info(msg, "Prev Object", stringifyForLogging(prevObj, drd), "Updated Object", stringifyForLogging(obj, drd), "name", drd.Name, "namespace", drd.Namespace)
+					sendEvent(sdk, drd, v1.EventTypeNormal, "UPDATE_SUCCESS", msg)
+					return resourceUpdated, nil
+				}
+			} else {
+				return "", nil
+			}
+		}
+	}
 }
 
 func sdkCreateOrUpdateAsNeeded(sdk client.Client, objFn func() (object, error), emptyObjFn func() object, updaterFn func(prev, curr object), drd *v1alpha1.Druid, names map[string]bool) (string, error) {
@@ -614,6 +723,53 @@ func makeService(svc *v1.Service, nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.
 	return svc, nil
 }
 
+func makeServiceMM(svc *v1.Service, nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map[string]string, name, nodeSpecUniqueStr string) (*v1.Service, error) {
+	svc.TypeMeta = metav1.TypeMeta{
+		APIVersion: "v1",
+		Kind:       "Service",
+	}
+
+	svc.ObjectMeta.Name = name
+
+	svc.ObjectMeta.Namespace = m.Namespace
+
+	if nodeSpec.ServiceAnnotations != nil || m.Spec.ServiceAnnotations != nil {
+		svc.ObjectMeta.Annotations = firstNonNilValue(nodeSpec.ServiceAnnotations, m.Spec.ServiceAnnotations).(map[string]string)
+		for k, v := range svc.ObjectMeta.Annotations {
+			svc.ObjectMeta.Labels[k] = v
+		}
+	}
+
+	if svc.ObjectMeta.Labels == nil {
+		svc.ObjectMeta.Labels = ls
+	} else {
+		for k, v := range ls {
+			svc.ObjectMeta.Labels[k] = v
+		}
+	}
+
+	if svc.Spec.Selector == nil {
+		svc.Spec.Selector = map[string]string{
+			"statefulset.kubernetes.io/pod-name": name,
+		}
+	} else {
+		for k, v := range ls {
+			svc.Spec.Selector[k] = v
+		}
+	}
+
+	if svc.Spec.Ports == nil {
+		svc.Spec.Ports = []v1.ServicePort{
+			{
+				Name:       "service-port",
+				Port:       nodeSpec.DruidPort,
+				TargetPort: intstr.FromInt(int(nodeSpec.DruidPort)),
+			},
+		}
+	}
+
+	return svc, nil
+}
 func getServiceName(nameTemplate, nodeSpecUniqueStr string) string {
 	if nameTemplate == "" {
 		return nodeSpecUniqueStr
@@ -759,6 +915,25 @@ func getRollingUpdateStrategy(nodeSpec *v1alpha1.DruidNodeSpec) *appsv1.RollingU
 }
 
 // makeStatefulSet shall create statefulset object.
+func makeStatefulSetMM(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map[string]string, name, nodeSpecUniqueStr, configMapSHA, serviceName string) (*appsv1.StatefulSet, error) {
+
+	return &appsv1.StatefulSet{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "StatefulSet",
+			APIVersion: "apps/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s", name),
+			Namespace: m.Namespace,
+			Labels: map[string]string{
+				name + "druidz": name,
+			},
+		},
+		Spec: makeStatefulSetSpec(nodeSpec, m, ls, nodeSpecUniqueStr, configMapSHA, serviceName),
+	}, nil
+}
+
+// makeStatefulSet shall create statefulset object.
 func makeStatefulSet(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map[string]string, nodeSpecUniqueStr, configMapSHA, serviceName string) (*appsv1.StatefulSet, error) {
 
 	return &appsv1.StatefulSet{
@@ -791,6 +966,28 @@ func makeDeployment(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map[
 
 // makeStatefulSetSpec shall create statefulset spec for statefulsets.
 func makeStatefulSetSpec(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map[string]string, nodeSpecificUniqueString, configMapSHA, serviceName string) appsv1.StatefulSetSpec {
+
+	updateStrategy := firstNonNilValue(m.Spec.UpdateStrategy, &appsv1.StatefulSetUpdateStrategy{}).(*appsv1.StatefulSetUpdateStrategy)
+	updateStrategy = firstNonNilValue(nodeSpec.UpdateStrategy, updateStrategy).(*appsv1.StatefulSetUpdateStrategy)
+
+	stsSpec := appsv1.StatefulSetSpec{
+		ServiceName: serviceName,
+		Selector: &metav1.LabelSelector{
+			MatchLabels: ls,
+		},
+		Replicas:             &nodeSpec.Replicas,
+		PodManagementPolicy:  appsv1.PodManagementPolicyType(firstNonEmptyStr(firstNonEmptyStr(string(nodeSpec.PodManagementPolicy), string(m.Spec.PodManagementPolicy)), string(appsv1.ParallelPodManagement))),
+		UpdateStrategy:       *updateStrategy,
+		Template:             makePodTemplate(nodeSpec, m, ls, nodeSpecificUniqueString, configMapSHA),
+		VolumeClaimTemplates: getPersistentVolumeClaim(nodeSpec, m),
+	}
+
+	return stsSpec
+
+}
+
+// makeStatefulSetSpec shall create statefulset spec for statefulsets.
+func makeStatefulSetSpecMM(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map[string]string, nodeSpecificUniqueString, configMapSHA, serviceName string) appsv1.StatefulSetSpec {
 
 	updateStrategy := firstNonNilValue(m.Spec.UpdateStrategy, &appsv1.StatefulSetUpdateStrategy{}).(*appsv1.StatefulSetUpdateStrategy)
 	updateStrategy = firstNonNilValue(nodeSpec.UpdateStrategy, updateStrategy).(*appsv1.StatefulSetUpdateStrategy)
@@ -965,6 +1162,18 @@ func addOwnerRefToObject(obj metav1.Object, ownerRef metav1.OwnerReference) {
 // asOwner returns an OwnerReference set as the druid CR
 func asOwner(m *v1alpha1.Druid) metav1.OwnerReference {
 	trueVar := true
+	return metav1.OwnerReference{
+		APIVersion: m.APIVersion,
+		Kind:       m.Kind,
+		Name:       m.Name,
+		UID:        m.UID,
+		Controller: &trueVar,
+	}
+}
+
+// asOwner returns an OwnerReference set as the druid CR
+func asOwnerR(m *v1alpha1.Druid) metav1.OwnerReference {
+	trueVar := false
 	return metav1.OwnerReference{
 		APIVersion: m.APIVersion,
 		Kind:       m.Kind,
@@ -1282,3 +1491,32 @@ func sdkDelete(ctx context.Context, sdk client.Client, obj runtime.Object) error
 }
 
 //--------------------------------------------------------------------------------------------------------------------
+
+func ScaleDown(url string) bool {
+	fmt.Println(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		fmt.Errorf("NewRequest construct error : %d", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e := fmt.Errorf("GET request error on URL specified : %v", err)
+		fmt.Println(e)
+	}
+
+	respData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Errorf("Reading Body Error : %d", err)
+	}
+	defer resp.Body.Close()
+	if string(respData) == "[]" {
+		fmt.Println(string(respData))
+		fmt.Println("Scale Down Podssssssssssssssssssssssssssssss")
+		return true
+	} else {
+		fmt.Println("Do Nothinggggggggggggggggggggggggggggggggggg")
+		return false
+	}
+
+}
